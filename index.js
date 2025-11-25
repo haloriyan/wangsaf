@@ -8,164 +8,203 @@ const path = require('path');
 const cors = require('cors');
 
 const app = express();
-app.use(cors())
+app.use(cors());
 app.use(express.json());
 
 const DEFAULT_BASE_URL = "http://10.10.100.213:8000";
 const PORT = process.env.PORT || 6969;
-const clients = {};
+
+const clients = {};           // Active WA clients
+const clientStatus = {};      // Status: qr/authenticated/ready/disconnected
+const qrCodes = {};           // Latest QR base64 for each client
+
 const SESSIONS_FILE = path.join(__dirname, 'clients.json');
 
-// Utility to load/save client IDs
+// ========================
+// Session Persistence
+// ========================
 function loadClients() {
-	if (!fs.existsSync(SESSIONS_FILE)) return [];
-	try {
-		return JSON.parse(fs.readFileSync(SESSIONS_FILE));
-	} catch {
-		return [];
-	}
+    if (!fs.existsSync(SESSIONS_FILE)) return [];
+    try {
+        return JSON.parse(fs.readFileSync(SESSIONS_FILE));
+    } catch {
+        return [];
+    }
 }
 
 function saveClients(clientIds) {
-	fs.writeFileSync(SESSIONS_FILE, JSON.stringify(clientIds, null, 4));
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(clientIds, null, 4));
 }
 
 const clientIds = loadClients();
 
-// Restore sessions on server start
+// ========================
+// Restore existing clients
+// ========================
 clientIds.forEach((client_id) => {
-	const client = new Client({
-		authStrategy: new LocalAuth({ clientId: client_id }),
-		puppeteer: {
-			headless: true,
-			timeout: 0,
-			args: [
-				'--no-sandbox',
-				'--disable-gpu',
-				'--disable-dev-shm-usage',
-				'--disable-setuid-sandbox',
-				'--disable-extensions',
-				'--disable-session-crashed-bubble',
-				'--disable-infobars',
-				'--single-process',
-				'--no-first-run',
-				'--start-maximized'
-			]
-		}
-	});
+    const client = new Client({
+        authStrategy: new LocalAuth({ clientId: client_id }),
+        puppeteer: {
+            headless: true,
+            timeout: 0,
+            args: [
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+                '--disable-setuid-sandbox',
+                '--disable-extensions',
+                '--disable-session-crashed-bubble',
+                '--disable-infobars',
+                '--single-process',
+                '--no-first-run',
+                '--start-maximized'
+            ]
+        }
+    });
 
-	clients[client_id] = client;
+    clients[client_id] = client;
+    clientStatus[client_id] = 'initializing';
 
-	client.on('ready', () => {
-		console.log(`Restored client ${client_id} is ready`);
-	});
+    client.on('qr', async (qr) => {
+        qrCodes[client_id] = await QRCode.toDataURL(qr);
+        clientStatus[client_id] = 'qr';
+        console.log(`QR Code refreshed for ${client_id}`);
+    });
 
-	client.on('auth_failure', msg => {
-		console.error(`Client ${client_id} auth failure:`, msg);
-	});
+    client.on('authenticated', () => {
+        clientStatus[client_id] = 'authenticated';
+        console.log(`Restored client ${client_id} authenticated`);
+    });
 
-	client.on('disconnected', () => {
-		console.log(`Client ${client_id} disconnected`);
-		delete clients[client_id];
-		const index = clientIds.indexOf(client_id);
-		if (index > -1) {
-			clientIds.splice(index, 1);
-			saveClients(clientIds);
-		}
-	});
+    client.on('ready', () => {
+        clientStatus[client_id] = 'ready';
+        console.log(`Restored client ${client_id} is ready`);
+    });
 
-	client.initialize();
+    client.on('disconnected', () => {
+        console.log(`Client ${client_id} disconnected`);
+        clientStatus[client_id] = 'disconnected';
+        delete clients[client_id];
+
+        const index = clientIds.indexOf(client_id);
+        if (index > -1) {
+            clientIds.splice(index, 1);
+            saveClients(clientIds);
+        }
+    });
+
+    client.initialize();
 });
 
-// Create a new WhatsApp session
+// ========================
+// Create New Client
+// ========================
 app.post('/connect', async (req, res) => {
-	const client_id = randomUUID();
-	const { callback_url } = req.body;
-	console.log('connecting');
+    const client_id = randomUUID();
+    const { callback_url } = req.body;
 
-	const client = new Client({
-		authStrategy: new LocalAuth({ clientId: client_id }),
-		puppeteer: {
-			headless: true,
-			timeout: 0,
-			args: [
-				'--no-sandbox',
-				'--disable-gpu',
-				'--disable-dev-shm-usage',
-				'--disable-setuid-sandbox',
-				'--disable-extensions',
-				'--disable-session-crashed-bubble',
-				'--disable-infobars',
-				'--single-process',
-				'--no-first-run',
-				'--start-maximized'
-			]
-		}
-	});
+    console.log("connecting new client:", client_id);
 
-	clients[client_id] = client;
-	clientIds.push(client_id);
-	saveClients(clientIds);
+    const client = new Client({
+        authStrategy: new LocalAuth({ clientId: client_id }),
+        puppeteer: {
+            headless: true,
+            timeout: 0,
+            args: [
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+                '--disable-setuid-sandbox',
+                '--disable-extensions',
+                '--disable-session-crashed-bubble',
+                '--disable-infobars',
+                '--single-process',
+                '--no-first-run',
+                '--start-maximized'
+            ]
+        }
+    });
 
-	client.on('qr', async (qr) => {
-		const base64 = await QRCode.toDataURL(qr);
-		console.log('QR Code received...');
+    clients[client_id] = client;
+    clientStatus[client_id] = 'initializing';
 
-		return res.status(200).json({
-			client_id,
-			qr: base64
-		});
-	});
+    clientIds.push(client_id);
+    saveClients(clientIds);
 
-	client.on('ready', async () => {
-		console.log(`Client ${client_id} is ready`);
+    // Event handlers
+    client.on('qr', async (qr) => {
+        qrCodes[client_id] = await QRCode.toDataURL(qr);
+        clientStatus[client_id] = 'qr';
+        console.log('QR Code received:', client_id);
+    });
 
-		try {
-			const { wid, pushname } = client.info;
-			const number = wid.user;
-			const profilePicUrl = await client.getProfilePicUrl(wid._serialized);
-			const BASE_URL = callback_url ? callback_url : DEFAULT_BASE_URL + "/api/callback/wa";
+    client.on('authenticated', () => {
+        clientStatus[client_id] = 'authenticated';
+        console.log(`Client ${client_id} authenticated`);
+    });
 
-			await axios.post(BASE_URL, {
-				client_id,
-				status: 'connected',
-				name: pushname,
-				number,
-				profile_picture: profilePicUrl
-			});
+    client.on('ready', async () => {
+        clientStatus[client_id] = 'ready';
+        console.log(`Client ${client_id} is ready`);
 
-			console.log(`Callback sent for ${client_id}`);
-		} catch (error) {
-			console.error(`Callback error for ${client_id}:`, error.message);
-		}
-	});
+        try {
+            const { wid, pushname } = client.info;
+            const number = wid.user;
+            const profilePicUrl = await client.getProfilePicUrl(wid._serialized);
+            const BASE_URL = callback_url || DEFAULT_BASE_URL + "/api/callback/wa";
 
-	client.on('authenticated', () => {
-		console.log(`Client ${client_id} authenticated`);
-	});
+            await axios.post(BASE_URL, {
+                client_id,
+                status: 'connected',
+                name: pushname,
+                number,
+                profile_picture: profilePicUrl
+            });
 
-	client.on('auth_failure', msg => {
-		console.error(`Client ${client_id} auth failure:`, msg);
-	});
+            console.log(`Callback sent for ${client_id}`);
+        } catch (err) {
+            console.error(`Callback error for ${client_id}:`, err.message);
+        }
+    });
 
-	client.on('change_state', (state) => {
-		console.log(`Client ${client_id} state changed to ${state}`);
-	});
+    client.on('disconnected', () => {
+        clientStatus[client_id] = 'disconnected';
+        delete clients[client_id];
 
-	client.on('disconnected', (reason) => {
-		console.log(`Client ${client_id} disconnected. Reason : ${reason}`);
-		delete clients[client_id];
-		const index = clientIds.indexOf(client_id);
-		if (index > -1) {
-			clientIds.splice(index, 1);
-			saveClients(clientIds);
-		}
-	});
+        const index = clientIds.indexOf(client_id);
+        if (index > -1) {
+            clientIds.splice(index, 1);
+            saveClients(clientIds);
+        }
+        console.log(`Client ${client_id} disconnected`);
+    });
 
-	client.initialize();
+    client.initialize();
+
+    // Send response ONCE — no matter how many QR updates later
+    res.json({ client_id, status: clientStatus[client_id] });
 });
 
-// Send message from a client
+// ========================
+// Fetch QR / Status
+// ========================
+app.get('/status/:client_id', (req, res) => {
+    const { client_id } = req.params;
+    res.json({
+        client_id,
+        status: clientStatus[client_id] || "not_found"
+    });
+});
+
+app.get('/qr/:client_id', (req, res) => {
+    const { client_id } = req.params;
+    if (!qrCodes[client_id]) return res.status(202).json({ status: clientStatus[client_id] });
+    res.json({ client_id, qr: qrCodes[client_id] });
+});
+
+// ========================
+// Send Message
+// ========================
 app.post('/send', async (req, res) => {
     const { client_id, destination, message, image, button_url, button_text } = req.body;
 
@@ -177,162 +216,72 @@ app.post('/send', async (req, res) => {
     }
 
     const client = clients[client_id];
-    if (!client) {
-        return res.status(404).json({
-            status: false,
-            error: 'Client not found or not connected',
-        });
+    if (!client || clientStatus[client_id] !== "ready") {
+        return res.status(404).json({ status: false, error: 'Client not ready' });
     }
 
     const number = destination.includes('@c.us') ? destination : `${destination}@c.us`;
 
     try {
-        // 🟢 Set presence to online
         await client.sendPresenceAvailable();
+        const chat = await client.getChatById(number);
 
-		const chat = await client.getChatById(number)
+        if (chat.sendStateTyping) await chat.sendStateTyping();
+        const delay = Math.min(message.length * 100, 5000);
+        await new Promise(r => setTimeout(r, delay));
 
-        // ⌨️ Start typing simulation
-        if (chat.sendStateTyping) {
-			await chat.sendStateTyping();
-		}
-
-        // ⏳ Simulate delay (customizable)
-        // await new Promise(resolve => setTimeout(resolve, 2000));
-		const delay = Math.min(message.length * 100, 5000);
-		await new Promise(res => setTimeout(res, delay));
-
-        // ✋ Stop typing
         await chat.clearState(number);
 
-        // 📩 Now send the actual message
         if (image) {
             const media = await MessageMedia.fromUrl(image);
             await client.sendMessage(number, media, { caption: message });
-
-        } else if (button_url && typeof button_url === 'string') {
-            const button = new Buttons(
-                message,
-                [{ type: 'url', url: button_url, body: button_text }],
-                'Visit Link',
-                'Footer (opt)'
-            );
+        } else if (button_url) {
+            const button = new Buttons(message, [{ type: 'url', url: button_url, body: button_text }], '', '');
             await client.sendMessage(number, button);
-
         } else {
             await client.sendMessage(number, message);
         }
 
-        return res.status(200).json({
-            status: true,
-            message: 'Message sent with typing simulation'
-        });
+        res.status(200).json({ status: true, message: 'Message sent' });
 
     } catch (err) {
         console.error(err);
-        return res.status(500).json({
-            status: false,
-            error: 'Failed to send message',
-        });
+        res.status(500).json({ status: false, error: 'Failed to send message' });
     }
 });
 
+// ========================
+// Disconnect Client
+// ========================
 app.post('/disconnect', async (req, res) => {
-	const { client_id } = req.body;
+    const { client_id } = req.body;
 
-	if (!client_id) {
-		return res.status(400).json({
-			status: false,
-			error: 'client_id is required'
-		});
-	}
+    const client = clients[client_id];
+    if (!client) return res.status(404).json({ status: false, error: 'Client not found' });
 
-	const client = clients[client_id];
-	if (!client) {
-		return res.status(404).json({
-			status: false,
-			error: 'Client not found or already disconnected'
-		});
-	}
+    try {
+        await client.logout();
+        await client.destroy();
+        delete clients[client_id];
+        delete qrCodes[client_id];
+        clientStatus[client_id] = 'disconnected';
 
-	try {
-		await client.logout(); // Proper API call to unlink WhatsApp device
-		await client.destroy(); // Cleanup Puppeteer
+        const index = clientIds.indexOf(client_id);
+        if (index > -1) {
+            clientIds.splice(index, 1);
+            saveClients(clientIds);
+        }
 
-		// Remove from in-memory sessions
-		delete clients[client_id];
+        res.json({ status: true, message: 'Client disconnected' });
 
-		// Remove from saved sessions file
-		const index = clientIds.indexOf(client_id);
-		if (index > -1) {
-			clientIds.splice(index, 1);
-			saveClients(clientIds);
-		}
-
-		console.log(`Client ${client_id} successfully disconnected`);
-
-		return res.status(200).json({
-			status: true,
-			message: 'Client successfully disconnected'
-		});
-
-	} catch (err) {
-		console.error(`Disconnect failed for ${client_id}:`, err.message);
-
-		return res.status(500).json({
-			status: false,
-			error: 'Failed to disconnect the session'
-		});
-	}
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ status: false, error: 'Failed to disconnect' });
+    }
 });
 
-app.post('/sendori', async (req, res) => {
-	const { client_id, destination, message, image, button_url, button_text } = req.body;
-
-	if (!client_id || !destination || !message) {
-		return res.status(400).json({
-			status: false,
-			error: 'client_id, destination, and message are required',
-		});
-	}
-
-	const client = clients[client_id];
-	if (!client) {
-		return res.status(404).json({
-			status: false,
-			error: 'Client not found or not connected',
-		});
-	}
-
-	const number = destination.includes('@c.us') ? destination : `${destination}@c.us`;
-
-	try {
-		if (image) {
-			const media = await MessageMedia.fromUrl(image);
-			await client.sendMessage(number, media, { caption: message });
-		} else if (button_url && typeof button_url === 'string') {
-			const button = new Buttons(
-				message,
-				[{ type: 'url', url: button_url, body: button_text }],
-				'Visit Link',
-				'Footer (opt)'
-			);
-			await client.sendMessage(number, button);
-		} else {
-			await client.sendMessage(number, message);
-		}
-
-		return res.status(200).json({ status: true, message: 'Message sent' });
-
-	} catch (err) {
-		console.error(err);
-		return res.status(500).json({
-			status: false,
-			error: 'Failed to send message',
-		});
-	}
-});
+// ========================
 
 app.listen(PORT, () => {
-	console.log(`Server started on http://localhost:${PORT}`);
+    console.log(`Server started on http://localhost:${PORT}`);
 });
