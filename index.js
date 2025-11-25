@@ -11,7 +11,7 @@ const app = express();
 app.use(cors())
 app.use(express.json());
 
-const BASE_URL = "http://10.10.100.213:8000";
+const DEFAULT_BASE_URL = "http://10.10.100.213:8000";
 const PORT = process.env.PORT || 6969;
 const clients = {};
 const SESSIONS_FILE = path.join(__dirname, 'clients.json');
@@ -80,6 +80,7 @@ clientIds.forEach((client_id) => {
 // Create a new WhatsApp session
 app.post('/connect', async (req, res) => {
 	const client_id = randomUUID();
+	const { callback_url } = req.body;
 	console.log('connecting');
 
 	const client = new Client({
@@ -123,8 +124,9 @@ app.post('/connect', async (req, res) => {
 			const { wid, pushname } = client.info;
 			const number = wid.user;
 			const profilePicUrl = await client.getProfilePicUrl(wid._serialized);
+			const BASE_URL = callback_url ? callback_url : DEFAULT_BASE_URL + "/api/callback/wa";
 
-			await axios.post(`${BASE_URL}/api/callback/wa`, {
+			await axios.post(BASE_URL, {
 				client_id,
 				status: 'connected',
 				name: pushname,
